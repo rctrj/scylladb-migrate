@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
 
     let db_url = arg_or_env(&args, ARG_KEY_DB_URL, ENV_KEY_DB_URL);
     let mut dir_path = arg_or_env(&args, ARG_KEY_PATH, ENV_KEY_PATH);
-    if dir_path == "" {
+    if dir_path.is_empty() {
         dir_path = ".".to_string()
     }
     let dir_path = dir_path;
@@ -89,9 +89,7 @@ async fn up(db_url: &str, dir_path: &str) -> Result<()> {
         let resp = apply_migration(&session, up.as_str()).await;
         db::upsert(&session, migration, resp.is_ok(), now).await?;
 
-        if !resp.is_ok() {
-            return resp
-        }
+        resp?;
     }
 
     Ok(())
@@ -106,8 +104,8 @@ async fn down(args: Vec<String>, db_url: &str, dir_path: &str) -> Result<()> {
 
         for migration in iter {
             let down = format!("{dir_path}/{migration}/down.cql");
-            apply_migration(&session, down.as_str()).await?;
-            db::delete(&session, migration.clone()).await?;
+            apply_migration(session, down.as_str()).await?;
+            db::delete(session, migration.clone()).await?;
         }
 
         Ok(())
@@ -115,17 +113,15 @@ async fn down(args: Vec<String>, db_url: &str, dir_path: &str) -> Result<()> {
 
     let migrations_to_revert = if args.contains(&ARG_KEY_ALL.to_string()) {
         db_migrations
+    } else if let Some(first) = db_migrations.last() {
+        vec![first.clone()]
     } else {
-        if let Some(first) = db_migrations.last() {
-            vec![first.clone()]
-        } else {
-            vec![]
-        }
+        vec![]
     };
 
     if migrations_to_revert.is_empty() {
         print!("no migrations to revert");
-        return Ok(())
+        return Ok(());
     }
 
     println!("applied migrations to revert: [{:?}]", migrations_to_revert);
@@ -134,13 +130,12 @@ async fn down(args: Vec<String>, db_url: &str, dir_path: &str) -> Result<()> {
 
 async fn apply_migration(session: &Session, migration_path: &str) -> Result<()> {
     let query = file_contents(migration_path)?;
-    let query = query.replace("\n", " ");
 
     // unable to pass queries in a single request.
     // batch request doesn't accept create table queries.
     // so splitting for now
     let queries: Vec<&str> = query
-        .split(";")
+        .split(';')
         .filter(|q| !q.is_empty())
         .collect();
 
