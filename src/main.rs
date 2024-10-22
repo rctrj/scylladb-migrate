@@ -1,6 +1,8 @@
+mod db;
+
 use anyhow::Result;
 use chrono::Utc;
-use scylla::{FromRow, IntoTypedRows, Session, SessionBuilder};
+use scylla::Session;
 use std::env::args;
 use std::fs::{create_dir, read_dir, read_to_string, File};
 use std::path::Path;
@@ -12,12 +14,6 @@ const ENV_KEY_PATH: &str = "SCYLLADB_MIGRATE_DIR_PATH";
 const ENV_KEY_DB_URL: &str = "SCYLLADB_MIGRATE_DB_URL";
 
 const PARTITION_KEY: &str = "migrate";
-
-#[derive(Debug, FromRow)]
-struct MigrationData {
-    id: String,
-    status: String,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -70,9 +66,9 @@ fn generate(args: Vec<String>, dir_path: &str) -> Result<()> {
 }
 
 async fn up(db_url: &str, dir_path: &str) -> Result<()> {
-    let session = session(db_url).await?;
+    let session = db::session(db_url).await?;
     let local_migrations = subdirectories(dir_path)?;
-    let db_migrations = db_migrations(&session).await?;
+    let db_migrations = db::list(&session).await?;
     println!("local migrations: {local_migrations:?}, applied migrations: {db_migrations:?}");
 
     let migrations_to_apply: Vec<String> = local_migrations
@@ -91,7 +87,7 @@ async fn up(db_url: &str, dir_path: &str) -> Result<()> {
         let up = format!("{dir_path}/{migration}/up.cql");
 
         let resp = apply_migration(&session, up.as_str()).await;
-        save_migration(&session, migration, resp.is_ok(), now).await?;
+        db::upsert(&session, migration, resp.is_ok(), now).await?;
 
         if !resp.is_ok() {
             return resp
@@ -102,8 +98,8 @@ async fn up(db_url: &str, dir_path: &str) -> Result<()> {
 }
 
 async fn down(args: Vec<String>, db_url: &str, dir_path: &str) -> Result<()> {
-    let session = session(db_url).await?;
-    let db_migrations = db_migrations(&session).await?;
+    let session = db::session(db_url).await?;
+    let db_migrations = db::list(&session).await?;
 
     async fn revert(session: &Session, dir_path: &str, migrations: Vec<String>) -> Result<()> {
         let iter = migrations.iter().rev();
@@ -111,7 +107,7 @@ async fn down(args: Vec<String>, db_url: &str, dir_path: &str) -> Result<()> {
         for migration in iter {
             let down = format!("{dir_path}/{migration}/down.cql");
             apply_migration(&session, down.as_str()).await?;
-            delete_migration(&session, migration.clone()).await?;
+            db::delete(&session, migration.clone()).await?;
         }
 
         Ok(())
@@ -158,69 +154,6 @@ async fn apply_migration(session: &Session, migration_path: &str) -> Result<()> 
     Ok(())
 }
 
-async fn save_migration(
-    session: &Session,
-    migration: String,
-    success: bool,
-    now: chrono::DateTime<Utc>,
-) -> Result<()> {
-    let status = if success { "success" } else { "failed" };
-
-    session
-        .query_unpaged(
-            "
-                INSERT INTO scylladb_migrate_ks.migrations (type, id, status, run_at)
-                VALUES (?, ?, ?, ?)
-                ",
-            (PARTITION_KEY, migration, status, now),
-        )
-        .await?;
-
-    Ok(())
-}
-
-async fn delete_migration(session: &Session, migration: String) -> Result<()>{
-    session
-        .query_unpaged(
-            "
-                DELETE FROM scylladb_migrate_ks.migrations
-                WHERE type = ?
-                AND id = ?
-            ",
-            (PARTITION_KEY, migration)
-        )
-        .await?;
-
-    Ok(())
-}
-
-async fn db_migrations(session: &Session) -> Result<Vec<String>> {
-    Ok(
-        session
-            .query_unpaged(
-                "
-            SELECT id, status
-            FROM scylladb_migrate_ks.migrations
-            WHERE type = ?
-            ORDER BY id
-            ",
-                (PARTITION_KEY,),
-            )
-            .await?
-            .rows
-            .unwrap()
-            .into_typed::<MigrationData>()
-            .filter_map(|r| {
-                let r = r.ok()?;
-                if r.status == "success" {
-                    return Some(r.id);
-                }
-                None
-            })
-            .collect()
-    )
-}
-
 fn subdirectories(dir_path: &str) -> Result<Vec<String>> {
     let entries = read_dir(dir_path)?;
 
@@ -247,42 +180,6 @@ fn subdirectories(dir_path: &str) -> Result<Vec<String>> {
 
 fn file_contents(path: &str) -> Result<String> {
     Ok(read_to_string(path)?)
-}
-
-async fn session(db_url: &str) -> Result<Session> {
-    let session = SessionBuilder::new()
-        .known_node(db_url)
-        .build()
-        .await?;
-
-    session
-        .query_unpaged(
-            "
-            CREATE KEYSPACE IF NOT EXISTS scylladb_migrate_ks
-            WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}
-            ",
-            &[],
-        )
-        .await?;
-
-    session
-        .query_unpaged(
-            "
-            CREATE TABLE IF NOT EXISTS scylladb_migrate_ks.migrations
-            (
-                type TEXT,
-                id TEXT,
-                status TEXT,
-                run_at TIMESTAMP,
-
-                PRIMARY KEY (type, id)
-            )
-            ",
-            &[],
-        )
-        .await?;
-
-    Ok(session)
 }
 
 fn help() -> Result<()> {
