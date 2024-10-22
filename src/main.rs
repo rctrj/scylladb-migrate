@@ -7,6 +7,7 @@ use std::path::Path;
 
 const ARG_KEY_PATH: &str = "-p";
 const ARG_KEY_DB_URL: &str = "-u";
+const ARG_KEY_ALL: &str = "--all";
 const ENV_KEY_PATH: &str = "SCYLLADB_MIGRATE_DIR_PATH";
 const ENV_KEY_DB_URL: &str = "SCYLLADB_MIGRATE_DB_URL";
 
@@ -37,6 +38,7 @@ async fn main() -> Result<()> {
     match command.as_str() {
         "generate" => generate(args, dir_path.as_str()),
         "up" => up(db_url.as_str(), dir_path.as_str()).await,
+        "down" => down(args, db_url.as_str(), dir_path.as_str()).await,
         _ => help()
     }
 }
@@ -99,6 +101,41 @@ async fn up(db_url: &str, dir_path: &str) -> Result<()> {
     Ok(())
 }
 
+async fn down(args: Vec<String>, db_url: &str, dir_path: &str) -> Result<()> {
+    let session = session(db_url).await?;
+    let db_migrations = db_migrations(&session).await?;
+
+    async fn revert(session: &Session, dir_path: &str, migrations: Vec<String>) -> Result<()> {
+        let iter = migrations.iter().rev();
+
+        for migration in iter {
+            let down = format!("{dir_path}/{migration}/down.cql");
+            apply_migration(&session, down.as_str()).await?;
+            delete_migration(&session, migration.clone()).await?;
+        }
+
+        Ok(())
+    }
+
+    let migrations_to_revert = if args.contains(&ARG_KEY_ALL.to_string()) {
+        db_migrations
+    } else {
+        if let Some(first) = db_migrations.last() {
+            vec![first.clone()]
+        } else {
+            vec![]
+        }
+    };
+
+    if migrations_to_revert.is_empty() {
+        print!("no migrations to revert");
+        return Ok(())
+    }
+
+    println!("applied migrations to revert: [{:?}]", migrations_to_revert);
+    revert(&session, dir_path, migrations_to_revert).await
+}
+
 async fn apply_migration(session: &Session, migration_path: &str) -> Result<()> {
     let query = file_contents(migration_path)?;
     let query = query.replace("\n", " ");
@@ -111,7 +148,7 @@ async fn apply_migration(session: &Session, migration_path: &str) -> Result<()> 
         .filter(|q| !q.is_empty())
         .collect();
 
-    println!("applying migration: {migration_path}. Query: {query}");
+    println!("applying migration: {migration_path}");
 
     for query in queries {
         session.query_unpaged(query, &[]).await?;
@@ -136,6 +173,21 @@ async fn save_migration(
                 VALUES (?, ?, ?, ?)
                 ",
             (PARTITION_KEY, migration, status, now),
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn delete_migration(session: &Session, migration: String) -> Result<()>{
+    session
+        .query_unpaged(
+            "
+                DELETE FROM scylladb_migrate_ks.migrations
+                WHERE type = ?
+                AND id = ?
+            ",
+            (PARTITION_KEY, migration)
         )
         .await?;
 
