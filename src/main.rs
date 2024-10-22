@@ -24,17 +24,23 @@ async fn main() -> Result<()> {
     }
 
     let db_url = arg_or_env(&args, ARG_KEY_DB_URL, ENV_KEY_DB_URL);
+    let db_url = db_url.as_str();
+
     let mut dir_path = arg_or_env(&args, ARG_KEY_PATH, ENV_KEY_PATH);
     if dir_path.is_empty() {
         dir_path = ".".to_string()
     }
-    let dir_path = dir_path;
+    let dir_path = dir_path.as_str();
 
     let command = &args[1];
     match command.as_str() {
-        "generate" => generate(args, dir_path.as_str()),
-        "up" => up(db_url.as_str(), dir_path.as_str()).await,
-        "down" => down(args, db_url.as_str(), dir_path.as_str()).await,
+        "generate" => generate(args, dir_path),
+        "up" => up(db_url, dir_path).await,
+        "down" => down(args, db_url, dir_path).await,
+        "redo" => {
+            down(args, db_url, dir_path).await?;
+            up(db_url, dir_path).await
+        }
         _ => help()
     }
 }
